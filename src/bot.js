@@ -1,6 +1,8 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const { disambiguateProduct, getTokenStats } = require('./claude');
+const { saveProfile, getProfile, saveFeedback } = require('./db');
+const { runLearner } = require('./learner');
 const Monitor = require('./monitor');
 
 const token = process.env.TELEGRAM_TOKEN;
@@ -267,33 +269,89 @@ bot.on('callback_query', async (query) => {
     await bot.editMessageText('❌ Annullato. Scrivi un nuovo prodotto:', { chat_id: uid, message_id: query.message.message_id });
     return;
   }
+
+  // ── Feedback annuncio
+  if (data.startsWith('good_') || data.startsWith('false_')) {
+    const isGood = data.startsWith('good_');
+    const itemId = data.slice(isGood ? 5 : 6);
+    const feedbackType = isGood ? 'good' : 'false_positive';
+    const profileId = state?.searchConfig?.profileId || state?.finalConfig?.profileId || null;
+    const itemTitle = query.message.caption || query.message.text || '';
+
+    try {
+      await saveFeedback({ profileId, itemId, itemTitle, feedback: feedbackType });
+      if (feedbackType === 'false_positive' && profileId) {
+        runLearner(profileId).catch((err) => console.error('[Bot] Errore learner:', err.message));
+      }
+    } catch (err) {
+      console.error('[Bot] Errore salvataggio feedback:', err.message);
+    }
+
+    await bot.answerCallbackQuery(query.id, { text: 'Grazie per il feedback!' });
+    await bot.editMessageReplyMarkup({ inline_keyboard: [] }, {
+      chat_id: uid,
+      message_id: query.message.message_id,
+    });
+    return;
+  }
 });
 
 // ─── Step 1: input prodotto ───────────────────────────────────────────────────
 
 async function handleProductInput(uid, text) {
-  await bot.sendMessage(uid, '🔍 Analizzo con AI...');
+  await bot.sendMessage(uid, '🔍 Cerco il prodotto...');
 
-  let result;
-  try {
-    result = await disambiguateProduct(text);
-  } catch (err) {
-    console.error('[Bot] Errore disambiguazione:', err.message);
-    const userMsg = err.message === 'TOKEN_LIMIT_REACHED'
-      ? '⚠️ Limite token giornaliero raggiunto. Riprova domani.'
-      : `❌ Errore AI: ${err.message}\n\nRiprova o scrivi il prodotto diversamente.`;
-    await bot.sendMessage(uid, userMsg);
-    return;
-  }
+  let profileId = null;
+  let searchConfig = null;
 
-  setState(uid, {
-    step: 'awaiting_category',
-    searchConfig: {
+  // Cerca prima nel DB per nome canonico (case-insensitive)
+  const existing = await getProfile(text.trim());
+  if (existing) {
+    console.log(`[Bot] Profilo trovato nel DB: ${existing.product_name} (id=${existing.id})`);
+    profileId = existing.id;
+    searchConfig = {
+      keywords: existing.keywords,
+      priceMin: existing.price_min,
+      priceMax: existing.price_max,
+      nomeCanonoco: existing.product_name,
+      profileId,
+    };
+    await bot.sendMessage(uid, `✅ Profilo già esistente: *${escapeMarkdown(existing.product_name)}*\n_(dati caricati dal DB, nessuna chiamata AI)_`, { parse_mode: 'Markdown' });
+  } else {
+    // Nuovo prodotto: chiama Groq
+    await bot.sendMessage(uid, '🤖 Analizzo con AI...');
+    let result;
+    try {
+      result = await disambiguateProduct(text);
+    } catch (err) {
+      console.error('[Bot] Errore disambiguazione:', err.message);
+      const userMsg = err.message === 'TOKEN_LIMIT_REACHED'
+        ? '⚠️ Limite token giornaliero raggiunto. Riprova domani.'
+        : `❌ Errore AI: ${err.message}\n\nRiprova o scrivi il prodotto diversamente.`;
+      await bot.sendMessage(uid, userMsg);
+      return;
+    }
+
+    profileId = await saveProfile({
+      productName: result.nome_canonico,
+      keywords: result.keywords,
+      priceMin: result.prezzo_min,
+      priceMax: result.prezzo_max,
+    });
+    console.log(`[Bot] Nuovo profilo salvato nel DB: ${result.nome_canonico} (id=${profileId})`);
+
+    searchConfig = {
       keywords: result.keywords,
       priceMin: result.prezzo_min,
       priceMax: result.prezzo_max,
       nomeCanonoco: result.nome_canonico,
-    },
+      profileId,
+    };
+  }
+
+  setState(uid, {
+    step: 'awaiting_category',
+    searchConfig,
   });
 
   await bot.sendMessage(
@@ -371,9 +429,16 @@ async function notifyMatch(item) {
     (item.size ? `📏 ${escapeMarkdown(item.size)}\n` : '') +
     `🔗 [Vedi annuncio](${item.url})`;
 
+  const feedbackKeyboard = {
+    inline_keyboard: [[
+      { text: '✅ Buono', callback_data: `good_${item.id}` },
+      { text: '❌ Falso positivo', callback_data: `false_${item.id}` },
+    ]],
+  };
+
   if (item.photoUrl) {
     try {
-      await bot.sendPhoto(chatId, item.photoUrl, { caption, parse_mode: 'Markdown' });
+      await bot.sendPhoto(chatId, item.photoUrl, { caption, parse_mode: 'Markdown', reply_markup: feedbackKeyboard });
       if (AUTO_BUY) await autoBuy(item);
       return;
     } catch {
@@ -381,7 +446,7 @@ async function notifyMatch(item) {
     }
   }
 
-  await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown' });
+  await bot.sendMessage(chatId, caption, { parse_mode: 'Markdown', reply_markup: feedbackKeyboard });
   if (AUTO_BUY) await autoBuy(item);
 }
 

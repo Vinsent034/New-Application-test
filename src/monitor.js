@@ -1,4 +1,5 @@
 const { searchItems } = require('./vinted');
+const { isSeen, markSeen, getProfile } = require('./db');
 
 // Solo parole che DA SOLE indicano certamente un accessorio (non la console/prodotto)
 const NEGATIVE_KEYWORDS = [
@@ -39,7 +40,6 @@ class Monitor {
     this.onMatch = onMatch;
     this.onError = null;       // callback(message) per notificare errori persistenti all'utente
     this.onTokenLimit = null;  // callback() per limite token raggiunto
-    this.seenIds = new Set();
     this.searchConfig = null;
     this.timer = null;
     this.running = false;
@@ -48,7 +48,6 @@ class Monitor {
 
   start(searchConfig) {
     this.searchConfig = searchConfig;
-    this.seenIds.clear();
     this.running = true;
     this.consecutiveErrors = 0;
 
@@ -69,7 +68,6 @@ class Monitor {
   stop() {
     this.running = false;
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
-    this.seenIds.clear();
     this.searchConfig = null;
     console.log('[Monitor] Fermato.');
   }
@@ -78,8 +76,9 @@ class Monitor {
 
   // Al seed registra gli ID E invia subito quelli che matchano i filtri
   async _seedInitialIds() {
+    const profileId = this.searchConfig.profileId;
     const items = await this._fetch();
-    for (const item of items) this.seenIds.add(item.id);
+    for (const item of items) await markSeen({ id: item.id, profileId, title: item.title, price: item.price });
     console.log(`[Monitor] ${items.length} annunci trovati al seed, valuto i match...`);
     if (items.length === 0) {
       console.warn('[Monitor] ATTENZIONE: 0 annunci trovati. Prova keywords più semplici.');
@@ -109,13 +108,15 @@ class Monitor {
       return;
     }
 
-    const newItems = items.filter((item) => !this.seenIds.has(item.id));
+    const seenFlags = await Promise.all(items.map((item) => isSeen(item.id)));
+    const newItems = items.filter((_, i) => !seenFlags[i]);
     if (newItems.length > 0) {
       console.log(`[Monitor] ${newItems.length} nuovi annunci trovati.`);
     }
 
+    const profileId = this.searchConfig.profileId;
     for (const item of newItems) {
-      this.seenIds.add(item.id);
+      await markSeen({ id: item.id, profileId, title: item.title, price: item.price });
       await this._evaluate(item);
     }
   }
@@ -135,7 +136,7 @@ class Monitor {
   }
 
   async _evaluate(item) {
-    const { keywords } = this.searchConfig;
+    const { keywords, profileId } = this.searchConfig;
 
     if (isObviouslyIrrelevant(item.title)) {
       console.log(`[Monitor] Scartato (accessorio): ${item.title}`);
@@ -145,6 +146,24 @@ class Monitor {
     if (!matchesKeywords(item.title, keywords)) {
       console.log(`[Monitor] Scartato (keyword assente): ${item.title}`);
       return;
+    }
+
+    // Carica negative keywords dinamiche dal DB (apprese dal learner)
+    if (profileId) {
+      try {
+        const profile = await getProfile(profileId);
+        const dynamicNegative = profile?.negative_keywords || [];
+        if (dynamicNegative.length > 0) {
+          const lower = item.title.toLowerCase();
+          const blocked = dynamicNegative.find((kw) => lower.includes(kw.toLowerCase()));
+          if (blocked) {
+            console.log(`[Monitor] Scartato (negative keyword appresa: "${blocked}"): ${item.title}`);
+            return;
+          }
+        }
+      } catch (err) {
+        console.error('[Monitor] Errore lettura negative keywords:', err.message);
+      }
     }
 
     try {
