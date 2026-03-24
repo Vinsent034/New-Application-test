@@ -1,0 +1,14 @@
+{
+  "name": "vinted-hunter",
+  "version": "1.0.0",
+  "description": "Bot Telegram per monitorare annunci Vinted con analisi AI",
+  "main": "src/bot.js",
+  "scripts": {
+    "start": "node src/bot.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "node-telegram-bot-api": "^0.64.0"
+  }
+}
